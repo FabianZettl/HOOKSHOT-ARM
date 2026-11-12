@@ -10,6 +10,11 @@
      address, si_code TRAP_PERF), allowed on our own threads at the default perf_event_paranoid (2).
    Frames are written as <module>+<offset from its load base>: hookshot and hookshot_vk.so,
    offsets as in their linker maps (position-independent, based at 0). */
+#if defined(__aarch64__)
+#define UC_PC(u) ((uintptr_t)(u)->uc_mcontext.pc)   /* (arm64 host) */
+#else
+#define UC_PC(u) ((uintptr_t)(u)->uc_mcontext.gregs[REG_RIP])
+#endif
 #include "../hos.h"
 #include <dirent.h>
 #include <dlfcn.h>
@@ -182,7 +187,7 @@ static void on_sample(int sig, siginfo_t *si, void *uctx) {
     const int saved = errno;
     if ((int)syscall(SYS_gettid) == sample_tid) {
         const ucontext_t *u = (const ucontext_t *)uctx;
-        const uintptr_t rip = (uintptr_t)u->uc_mcontext.gregs[REG_RIP];
+        const uintptr_t rip = UC_PC(u);
         Walk w = {sample_pcs + 1, 0, DEPTH - 1, rip, 0};
         sample_pcs[0] = rip;
         _Unwind_Backtrace(walk_step, &w);
@@ -394,7 +399,7 @@ static void on_watch(int sig, siginfo_t *si, void *uctx) {
     /* (si_perf_data, the event's sig_data: the watch's index. glibc's siginfo_t has no name for it: the kernel puts it
        after si_addr, at 24) */
     const unsigned long idx = *(const unsigned long *)((const char *)si + 24) & 3;
-    const uint64_t rip = (uint64_t)((const ucontext_t *)uctx)->uc_mcontext.gregs[REG_RIP];
+    const uint64_t rip = (uint64_t)UC_PC((const ucontext_t *)uctx);
     const uint64_t key = ((uint64_t)(watch_phase & 1) << 62) | ((uint64_t)idx << 58) | rip;
     for (uint32_t i = (uint32_t)((key >> 2) * 2654435761u) & 8191, n = 0; n < 8192; n++, i = (i + 1) & 8191) {
         uint64_t k = __atomic_load_n(&watch_keys[i], __ATOMIC_RELAXED);

@@ -12,7 +12,11 @@
 #ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION   /* (older Windows SDKs lack it: Windows 10 1803 and later take it) */
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
+#if defined(__x86_64__) || defined(_M_X64)
 #include <emmintrin.h>
+#else
+#define _mm_pause() __asm__ volatile("yield")   /* (arm64 host) */
+#endif
 #ifdef __EMSCRIPTEN__
 #include <sched.h>
 #include <stdatomic.h>

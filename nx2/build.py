@@ -559,12 +559,13 @@ MARCH = os.environ.get("RX_MARCH") or host_march()
 if MARCH != "x86-64-v3":
     print("build: this CPU has no AVX2: the game is built for %s (a little slower)" % MARCH, flush=True)
 CPU = ["-march=" + MARCH, "-ffp-contract=off"]
+CX16 = [] if MARCH.startswith("armv") else ["-mcx16"]   # (arm64 host) cmpxchg16b is x86-only; CASP lowers natively there
 
 
 def flags(gen, rt64, opt, polls):
     return target() + CPU + [
         "-I" + rt64, "-I" + gen, "-I" + os.path.join(kit.KIT, "rt"), "-I" + NX2_RT, "-Wno-everything",
-        "-fno-strict-aliasing", "-mcx16", "-" + opt, "-g0", "-mllvm", "-rotation-max-header-size=0",
+        "-fno-strict-aliasing", *CX16, "-" + opt, "-g0", "-mllvm", "-rotation-max-header-size=0",
         "-ffunction-sections", "-mllvm", "-capture-tracking-max-uses-to-explore=5000"] + \
         (["-DA64_POLLING"] if polls else []) + WRITE_TRACK
 
@@ -835,7 +836,7 @@ def main():
         sum(1 for x in srcs if os.path.basename(x).startswith("code_"))), flush=True)
     # the runtime: ordinary C at -O2, with its own headers (any host/*.h change rebuilds all of it)
     host_fl = target() + CPU + (["-I" + POSIX, "-D_GNU_SOURCE"] if LINUX else []) + \
-        ["-I" + HOST, "-I" + rt64, "-I" + gen, "-Wno-everything", "-O2", "-g0", "-mcx16", "-DA64_POLLING"] + WRITE_TRACK
+        ["-I" + HOST, "-I" + rt64, "-I" + gen, "-Wno-everything", "-O2", "-g0", *CX16, "-DA64_POLLING"] + WRITE_TRACK
     host_deps = deps + b"".join(open(os.path.join(HOST, f), "rb").read() for f in sorted(os.listdir(HOST))
                                 if f.endswith(".h"))
     if LINUX:

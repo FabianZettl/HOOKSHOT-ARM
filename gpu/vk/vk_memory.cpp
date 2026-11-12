@@ -6,6 +6,7 @@
 // title and importing each is a buffer, a memory object and a device address (tens of seconds taken at one submit,
 // on the render thread, in the first frame). The table of pools is cheap to keep current (host->gpu_pools: two
 // numbers each) and is refreshed when its generation changes, at a submit.
+#include <atomic>
 #include <cstring>
 #include <algorithm>
 #include <array>
@@ -37,6 +38,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <sched.h>
 #endif
 #include "shaders/wb_diff_comp_spv.h"
 #include "vram_pressure.h"
@@ -144,7 +146,114 @@ int dmabuf_memfd = -2, dmabuf_dev = -1, dmabuf_failures = 0;
 uint64_t dmabuf_limit = 0;
 
 /// The memory of guest [lo, lo + size) as an imported dma-buf; VK_NULL_HANDLE when udmabuf or the import refused it
-VkDeviceMemory dma_buf_memory(uint64_t lo, uint64_t size) {
+bool dmabuf_export_mode = false;   // (arm64 / Turnip: no host-pointer import and no udmabuf: the GPU's memory becomes the window)
+
+std::atomic<uint64_t> export_conv_lo{0}, export_conv_hi{0};   // (the window range being copied and remapped: host addresses)
+
+/// A write into the range being converted: wait until the new mapping is in, then let the store run again
+LONG CALLBACK export_wait_handler(EXCEPTION_POINTERS* e) {
+    if (e->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || e->ExceptionRecord->NumberParameters < 2)
+        return EXCEPTION_CONTINUE_SEARCH;
+    const uint64_t a = (uint64_t)e->ExceptionRecord->ExceptionInformation[1];
+    const uint64_t lo = export_conv_lo.load(std::memory_order_acquire), hi = export_conv_hi.load(std::memory_order_acquire);
+    if (!lo || a < lo || a >= hi) return EXCEPTION_CONTINUE_SEARCH;
+    while (export_conv_lo.load(std::memory_order_acquire) == lo) sched_yield();
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+/// (export mode) Memory the GPU allocates and exports as a dma-buf, filled with guest [lo, lo + size) and mapped over the window
+/// there: the CPU and the GPU then share it, as with the imports. Only up to remap_hi is mapped over the window (a piece may run
+/// past the pool's end to a sparse block). The window's old pages stay in the memfd, unreferenced.
+VkDeviceMemory exported_memory(uint64_t lo, uint64_t size, uint64_t remap_hi) {
+    static uint32_t type = UINT32_MAX;
+    static std::mutex mu;
+    std::lock_guard lk(mu);
+    const uint64_t alloc = (size + 65535) & ~65535ull;
+    if (type == UINT32_MAX) {
+        VkExternalMemoryBufferCreateInfo eb{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
+        eb.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+        VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bi.pNext = &eb;
+        bi.size = 65536;
+        bi.usage = kUsage;
+        VkBuffer probe = VK_NULL_HANDLE;
+        if (vkCreateBuffer(dev.device, &bi, nullptr, &probe) != VK_SUCCESS) return VK_NULL_HANDLE;
+        VkMemoryRequirements mr{};
+        vkGetBufferMemoryRequirements(dev.device, probe, &mr);
+        vkDestroyBuffer(dev.device, probe, nullptr);
+        const VkMemoryPropertyFlags want[] = {
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT};
+        for (size_t w = 0; w < 3 && type == UINT32_MAX; w++)
+            for (uint32_t i = 0; i < dev.memory.memoryTypeCount && type == UINT32_MAX; i++)
+                if ((mr.memoryTypeBits >> i & 1) && (dev.memory.memoryTypes[i].propertyFlags & want[w]) == want[w]) type = i;
+        if (type == UINT32_MAX) {
+            logf("vk: export mode: no host-visible memory type for a buffer");
+            return VK_NULL_HANDLE;
+        }
+        logf("vk: guest memory exported from the GPU: memory type %u (flags %#x)", type, dev.memory.memoryTypes[type].propertyFlags);
+    }
+    VkExportMemoryAllocateInfo ex{VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO};
+    ex.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+    VkMemoryAllocateFlagsInfo fl{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+    fl.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+    fl.pNext = &ex;
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.pNext = &fl;
+    ai.allocationSize = alloc;
+    ai.memoryTypeIndex = type;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkResult r = vkAllocateMemory(dev.device, &ai, nullptr, &memory);
+    if (r != VK_SUCCESS) {
+        if (dmabuf_failures++ < 8) logf("vk: export mode: %llu bytes not allocated (VkResult %d)", (unsigned long long)alloc, (int)r);
+        return VK_NULL_HANDLE;
+    }
+    VkMemoryGetFdInfoKHR gi{VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR};
+    gi.memory = memory;
+    gi.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+    int fd = -1;
+    r = vkGetMemoryFdKHR(dev.device, &gi, &fd);
+    if (r != VK_SUCCESS || fd < 0) {
+        if (dmabuf_failures++ < 8) logf("vk: export mode: no dma-buf fd (VkResult %d)", (int)r);
+        vkFreeMemory(dev.device, memory, nullptr);
+        return VK_NULL_HANDLE;
+    }
+    const uint64_t map_n = lo + size > remap_hi ? (remap_hi > lo ? remap_hi - lo : 0) : size;
+    if (map_n) {
+        static std::once_flag once;
+        std::call_once(once, [] { AddVectoredExceptionHandler(1, export_wait_handler); });
+        uint8_t* win = host->guest_base() + lo;
+        void* tmp = mmap(nullptr, map_n, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (tmp == MAP_FAILED) {
+            if (dmabuf_failures++ < 8) logf("vk: export mode: the dma-buf cannot be mapped (errno %d)", errno);
+            close(fd);
+            vkFreeMemory(dev.device, memory, nullptr);
+            return VK_NULL_HANDLE;
+        }
+        // (the game's threads write into the window while it is copied: a write between the copy and the remap would be lost.
+        // The range is read-only for the copy; a thread that writes into it waits in export_wait_handler until the new mapping,
+        // read-write, is in place, then repeats its store)
+        export_conv_lo.store((uint64_t)(uintptr_t)win, std::memory_order_release);
+        export_conv_hi.store((uint64_t)(uintptr_t)win + map_n, std::memory_order_release);
+        mprotect(win, map_n, PROT_READ);
+        memcpy(tmp, win, map_n);
+        void* over = mmap(win, map_n, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0);
+        export_conv_lo.store(0, std::memory_order_release);
+        export_conv_hi.store(0, std::memory_order_release);
+        munmap(tmp, map_n);
+        if (over == MAP_FAILED) {
+            logf("vk: export mode: the window cannot be remapped (errno %d)", errno);
+            close(fd);
+            vkFreeMemory(dev.device, memory, nullptr);
+            return VK_NULL_HANDLE;
+        }
+    }
+    close(fd);
+    return memory;
+}
+
+VkDeviceMemory dma_buf_memory(uint64_t lo, uint64_t size, uint64_t remap_hi = ~0ull) {
+    if (dmabuf_export_mode) return exported_memory(lo, size, remap_hi);
     UdmabufCreate c{(uint32_t)dmabuf_memfd, 1 /* UDMABUF_FLAGS_CLOEXEC */, lo, size};
     const int fd = ioctl(dmabuf_dev, kUdmabufCreate, &c);
     if (fd < 0) {
@@ -224,7 +333,7 @@ bool import_dma_buf_pieces(uint64_t lo, uint64_t hi, uint64_t piece, Pool& p) {
     std::vector<VkSparseMemoryBind> binds;
     for (uint64_t off = 0; off < req.size; off += piece) {
         const uint64_t n = std::min(piece, req.size - off);
-        const VkDeviceMemory m = dma_buf_memory(lo + off, n);
+        const VkDeviceMemory m = dma_buf_memory(lo + off, n, hi);
         if (!m) break;
         memories.push_back(m);
         binds.push_back({off, n, m, 0, 0});
@@ -273,7 +382,14 @@ bool import_dma_buf(uint64_t lo, uint64_t hi, Pool& p) {
         const MemfdFn fn = getenv("RX_VK_NO_DMABUF") ? nullptr : (MemfdFn)dlsym(RTLD_DEFAULT, "hos_posix_guest_memfd");
         const int fd = fn ? fn() : -1;
         if (fd >= 0 && dev.dma_buf_import && vkGetMemoryFdPropertiesKHR) dmabuf_dev = open("/dev/udmabuf", O_RDWR | O_CLOEXEC);
-        if (fd >= 0 && dmabuf_dev >= 0) {
+        if (dmabuf_dev < 0 && !dev.external_memory_host && dev.dma_buf_import && dev.sparse_buffers && vkGetMemoryFdKHR &&
+            !getenv("RX_VK_NO_EXPORT")) {
+            dmabuf_export_mode = true;   // (no way to import the window: the GPU's memory is mapped over it, in pieces)
+            dmabuf_memfd = 0;   // (unused: the window may be anonymous memory)
+            dmabuf_limit = 32ull << 20;
+            piece = dmabuf_limit;
+            logf("vk: guest memory exported from the GPU in pieces of %llu MB", (unsigned long long)(piece >> 20));
+        } else if (fd >= 0 && dmabuf_dev >= 0) {
             dmabuf_memfd = fd;
             dmabuf_limit = 64ull << 20;
             if (FILE* f = fopen("/sys/module/udmabuf/parameters/size_limit_mb", "r")) {
@@ -305,7 +421,7 @@ bool import_dma_buf(uint64_t lo, uint64_t hi, Pool& p) {
         bi.usage = kUsage;
         VkBuffer buffer = VK_NULL_HANDLE;
         if (vkCreateBuffer(dev.device, &bi, nullptr, &buffer) != VK_SUCCESS) return false;
-        const VkDeviceMemory memory = dma_buf_memory(lo, hi - lo);
+        const VkDeviceMemory memory = dma_buf_memory(lo, hi - lo, hi);
         // Allocation alone does not make the buffer usable. A failed bind owns both resources,
         // but must leave no partial import for the host-pointer fallback to publish.
         if (!memory || vkBindBufferMemory(dev.device, buffer, memory, 0) != VK_SUCCESS) {
@@ -379,6 +495,10 @@ bool import_pool(uint64_t lo, uint64_t hi, Pool& p) {
         return true;
     }
 #endif
+    if (!dev.external_memory_host) {   // (export mode: no host pointers)
+        import_remember_failure(lo, hi);
+        return false;
+    }
     // (the host allocations' memory type: the same for every pointer, asked once)
     static uint32_t type = UINT32_MAX;
     if (type == UINT32_MAX) {
@@ -544,7 +664,9 @@ uint64_t memory_guest_pages() {
 }
 
 bool memory_init() {
-    if (!dev.external_memory_host) {
+    const bool export_ok = !dev.external_memory_host && dev.external_memory_fd && dev.dma_buf_import && dev.sparse_buffers &&
+                           vkGetMemoryFdKHR && !getenv("RX_VK_NO_EXPORT");
+    if (!dev.external_memory_host && !export_ok) {
         logf("vk: no VK_EXT_external_memory_host: the guest memory cannot be imported (needed for now)");
         return false;
     }
@@ -559,7 +681,7 @@ bool memory_init() {
     vkGetPhysicalDeviceProperties2(dev.physical, &p2);
     align = std::max<uint64_t>(hp.minImportedHostPointerAlignment, 4096);
     max_import_size = std::min(p11.maxMemoryAllocationSize, p13.maxBufferSize);
-    logf("vk: guest memory imported in place (alignment %llu)", (unsigned long long)align);
+    logf("vk: guest memory %s (alignment %llu)", export_ok ? "exported from the GPU" : "imported in place", (unsigned long long)align);
     return true;
 }
 
