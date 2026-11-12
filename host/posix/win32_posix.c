@@ -879,9 +879,12 @@ BOOL ReadFile(HANDLE h, void *buf, DWORD n, DWORD *got, OVERLAPPED *ov) {
     const int fd = ((HFile *)h)->fd;
     off_t at = ov ? (off_t)((uint64_t)ov->OffsetHigh << 32 | ov->Offset) : 0;
     DWORD done = 0;
+    int efault = 0;
     while (done < n) {
         const ssize_t r = ov ? pread(fd, (char *)buf + done, n - done, at + done) : read(fd, (char *)buf + done, n - done);
         if (r < 0 && errno == EINTR) continue;
+        /* the GPU export remaps guest pages read-only for a few ms; a syscall hitting one gets EFAULT, not a wait */
+        if (r < 0 && errno == EFAULT && ++efault < 5000) { usleep(200); continue; }
         if (r < 0) { if (got) *got = done; return fail_errno(); }
         if (!r) break;
         done += (DWORD)r;

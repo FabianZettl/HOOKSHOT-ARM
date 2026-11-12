@@ -27,11 +27,16 @@ ffmpeg-free development packages, then, from the clone:
 - `host/posix/win32_posix.c`: the signal handler's context for aarch64 (pc, sp, the write bit from the ESR).
 - `host/hos_setjmp.c`: `recomp_sj_setjmp` / `recomp_sj_longjmp` for aarch64.
 - `host/hos_thread.c`, `host/posix/windows.h`, `host/posix/prof.c`: pause and pc.
+- `nx2/build.py` (`armv*` only): `-fms-volatile` and `-fsigned-char` for the host code; `windows.h`: `_ReadWriteBarrier` is a full fence on aarch64. `win32_posix.c`: `ReadFile` retries on `EFAULT` (the export remaps a page read-only for a few ms). None of these fixed the crash below; they are kept because the x86 host code assumed them.
 - `gpu/vk/vk_memory.cpp`: **export mode.** Turnip has no `VK_EXT_external_memory_host` and many kernels no udmabuf, so
   the guest pools cannot be imported. Instead each pool piece (32 MB) is allocated as exportable device memory (a
   dma-buf), the guest bytes are copied into it and it is mapped over the guest window with `MAP_FIXED`. While a piece is
   copied its range is read-only and a thread that writes into it waits in a vectored exception handler until the new
   mapping is in. `RX_VK_NO_EXPORT=1` turns it off.
+
+## Known crash (open)
+
+Loading a save into the world (tested: Zora's Fountain) crashes every time, at the same place: a guest read through a garbage pointer (`0x0c58dffd000033ff`, looks like raw data, not a pointer) in guest function `f_8051ec30`, called from `f_805215b0`. Same with the headless and the Steam launch. Ruled out so far: x86 memory ordering (`-fms-volatile` plus fences), `char` signedness, `EFAULT` from file reads during the export copy. Not ruled out: the export mode itself, a bug in the lifter's non-x86 fallbacks, an HLE call that returns wrong data on aarch64. The title screen is stable at 54-60 fps; no in-world fps above ~9 was measured.
 
 ## Not checked
 

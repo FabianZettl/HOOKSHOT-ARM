@@ -147,7 +147,11 @@ void SetLastError(DWORD e);
 #define InterlockedCompareExchange64 InterlockedCompareExchange
 #define InterlockedCompareExchangePointer InterlockedCompareExchange
 #define MemoryBarrier() __atomic_thread_fence(__ATOMIC_SEQ_CST)
+#if defined(__aarch64__)
+#define _ReadWriteBarrier() __atomic_thread_fence(__ATOMIC_SEQ_CST)   /* (arm64 host: a hardware fence; x86 code assumes its ordering) */
+#else
 #define _ReadWriteBarrier() __atomic_signal_fence(__ATOMIC_SEQ_CST)
+#endif
 #if defined(__aarch64__)
 #define YieldProcessor() __asm__ volatile("yield")   /* (arm64 host) */
 #else
